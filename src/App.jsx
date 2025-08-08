@@ -1,90 +1,100 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, doc, onSnapshot, setDoc, getDocs, collection, query, addDoc } from 'firebase/firestore';
 import { Camera, Phone, Copy } from 'lucide-react';
 
-// Tailwind CSS is assumed to be available
-// Ensure you have a 'lucide-react' installed or use inline SVGs
+// This app uses Tailwind CSS, which is assumed to be available
 const App = () => {
-  // Use state to manage the app's internal data
+  // 1. Paste your Firebase config here
+  // IMPORTANT: Replace the placeholder values with your actual project's configuration.
+  const firebaseConfig = {
+    apiKey: import.meta.env.VITE_REACT_APP_FIREBASE_API_KEY,
+    authDomain: import.meta.env.VITE_REACT_APP_FIREBASE_AUTH_DOMAIN,
+    projectId: import.meta.env.VITE_REACT_APP_FIREBASE_PROJECT_ID,
+    storageBucket: import.meta.env.VITE_REACT_APP_FIREBASE_STORAGE_BUCKET,
+    messagingSenderId: import.meta.env.VITE_REACT_APP_FIREBASE_MESSAGING_SENDER_ID,
+    appId: import.meta.env.VITE_REACT_APP_FIREBASE_APP_ID
+  };
+  const appId = firebaseConfig.appId;
+
+  // State variables for managing the app's data
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const [callId, setCallId] = useState('');
-  const [userId, setUserId] = useState(null);
-  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [, setUserId] = useState(null);
+  const [, setIsAuthReady] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
 
-  // useRef is used to store references to the video elements and the RTCPeerConnection object
+  // useRef to hold references to DOM elements and the RTCPeerConnection object
   const localVideoRef = useRef();
   const remoteVideoRef = useRef();
   const pc = useRef(null);
 
-  // Firebase initialization and authentication
+  // Firebase service references
   const db = useRef(null);
   const auth = useRef(null);
-  
+
+  // This useEffect hook runs once to initialize Firebase and handle authentication
   useEffect(() => {
-    // This effect runs once to initialize Firebase and handle user authentication
     const setupFirebase = async () => {
       try {
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-        const firebaseApp = initializeApp(firebaseConfig, appId);
+        // CORRECTION: Removed the appId as a second argument. It's already in the config object.
+        const firebaseApp = initializeApp(firebaseConfig);
         db.current = getFirestore(firebaseApp);
         auth.current = getAuth(firebaseApp);
 
-        // Sign in with the custom token or anonymously if not available
-        if (typeof __initial_auth_token !== 'undefined') {
-          await signInWithCustomToken(auth.current, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth.current);
-        }
+        // For local development, use anonymous sign-in directly.
+        await signInAnonymously(auth.current);
 
-        // Listen for authentication state changes
+        // Set up an auth state change listener to get the user ID
         const unsubscribe = onAuthStateChanged(auth.current, (user) => {
           if (user) {
             setUserId(user.uid);
           } else {
-            setUserId(crypto.randomUUID()); // Use a random ID if not authenticated
+            // Fallback to a random ID if no user is authenticated
+            setUserId(crypto.randomUUID());
           }
           setIsAuthReady(true);
         });
 
+        // Cleanup function for the listener
         return () => unsubscribe();
       } catch (error) {
         console.error("Error setting up Firebase:", error);
+        setErrorMessage("Failed to set up Firebase. Check the console for details.");
       }
     };
     setupFirebase();
-  }, []);
+  }, [appId]);
 
-  // Effect to handle the remote stream
+  // Sync the remote stream with the video element
   useEffect(() => {
     if (remoteVideoRef.current && remoteStream) {
       remoteVideoRef.current.srcObject = remoteStream;
     }
   }, [remoteStream]);
-  
-  // Effect to handle the local stream
+
+  // Sync the local stream with the video element
   useEffect(() => {
     if (localVideoRef.current && localStream) {
       localVideoRef.current.srcObject = localStream;
     }
   }, [localStream]);
 
-  // Function to get access to the camera and microphone
+  // Function to get camera and microphone access
   const startCamera = async () => {
+    setErrorMessage('');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
     } catch (err) {
       console.error("Error accessing media devices:", err);
-      // Use a custom UI element instead of alert()
-      // You can add a state variable to control a modal here
+      setErrorMessage("Could not access camera/mic. Please check permissions.");
     }
   };
 
-  // Helper function to create the RTCPeerConnection
+  // Centralized function to create and configure the RTCPeerConnection
   const createPeerConnection = () => {
     const iceServers = {
       iceServers: [
@@ -94,6 +104,7 @@ const App = () => {
       ],
     };
 
+    // Create the new peer connection instance
     const newPc = new RTCPeerConnection(iceServers);
     pc.current = newPc;
 
@@ -101,18 +112,21 @@ const App = () => {
     newPc.onicecandidate = async (event) => {
       if (event.candidate) {
         console.log("Found ICE candidate:", event.candidate);
-        const candidatesCollectionRef = collection(db.current, `artifacts/${__app_id}/public/data/calls/${callId}/candidates`);
-        await addDoc(candidatesCollectionRef, event.candidate.toJSON());
+        // Use the new appId variable here
+        const candidatesCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls/${callId}/candidates`);
+        // Add the candidate to Firestore, adding a type to distinguish caller/callee candidates
+        await addDoc(candidatesCollectionRef, { ...event.candidate.toJSON(), type: localStream === newPc.getLocalStreams()[0] ? 'caller' : 'callee' });
       }
     };
 
-    // Listen for the remote stream
+    // Listen for the remote track and add it to the remote video element
     newPc.ontrack = (event) => {
       if (event.streams && event.streams[0]) {
+        console.log("Received remote stream.");
         setRemoteStream(event.streams[0]);
       }
     };
-    
+
     // Add all local tracks to the peer connection
     localStream.getTracks().forEach((track) => {
       newPc.addTrack(track, localStream);
@@ -124,18 +138,22 @@ const App = () => {
   // Function for the 'caller' to create a new call
   const createCall = async () => {
     if (!db.current || !localStream) {
-      console.error("Firebase not initialized or no local stream.");
+      setErrorMessage("Please start your camera before creating a call.");
       return;
     }
 
+    // Generate a unique call ID
     const newCallId = Math.floor(Math.random() * 1000000).toString();
     setCallId(newCallId);
-    
-    const callsCollectionRef = collection(db.current, `artifacts/${__app_id}/public/data/calls`);
+    setErrorMessage(`Call created! Share this ID: ${newCallId}`);
+
+    // Use the new appId variable here
+    const callsCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls`);
     const newCallDocRef = doc(callsCollectionRef, newCallId);
 
     const newPc = createPeerConnection();
 
+    // Create the offer and set it as the local description
     const offer = await newPc.createOffer();
     await newPc.setLocalDescription(offer);
 
@@ -143,20 +161,23 @@ const App = () => {
     await setDoc(newCallDocRef, { offer: { ...offer.toJSON() } });
     console.log(`Call created with ID: ${newCallId}`);
 
-    // Listen for the answer from the 'callee'
+    // Listen for the answer from the callee
     onSnapshot(newCallDocRef, async (snapshot) => {
       const data = snapshot.data();
-      if (data?.answer && !newPc.currentRemoteDescription) {
+      // Only set the remote description if an answer exists and it hasn't been set yet
+      if (data?.answer && newPc.localDescription && !newPc.currentRemoteDescription) {
         console.log("Received answer:", data.answer);
         const answerDescription = new RTCSessionDescription(data.answer);
         await newPc.setRemoteDescription(answerDescription);
       }
     });
 
-    // Listen for ICE candidates from the 'callee' and add them to the connection
-    onSnapshot(collection(db.current, `artifacts/${__app_id}/public/data/calls/${newCallId}/answerCandidates`), async (snapshot) => {
+    // Listen for ICE candidates from the callee and add them
+    // Use the new appId variable here
+    const candidatesCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls/${newCallId}/candidates`);
+    onSnapshot(query(candidatesCollectionRef), (snapshot) => {
       snapshot.docChanges().forEach((change) => {
-        if (change.type === 'added') {
+        if (change.type === 'added' && change.doc.data().type === 'callee') {
           const candidate = new RTCIceCandidate(change.doc.data());
           newPc.addIceCandidate(candidate);
         }
@@ -167,21 +188,21 @@ const App = () => {
   // Function for the 'callee' to answer a call
   const answerCall = async () => {
     if (!db.current || !localStream || !callId) {
-      console.error("Firebase not initialized, no local stream, or no call ID.");
+      setErrorMessage("Please start your camera and enter a Call ID to answer.");
       return;
     }
 
     const newPc = createPeerConnection();
 
-    // Get the offer from Firestore
-    const callDocRef = doc(db.current, `artifacts/${__app_id}/public/data/calls/${callId}`);
-    const callSnapshot = await getDocs(query(collection(db.current, `artifacts/${__app_id}/public/data/calls`)));
-
-    // Check if the call exists
+    // Get the offer from Firestore for the specific call ID
+    // Use the new appId variable here
+    const callDocRef = doc(db.current, `artifacts/${appId}/public/data/calls/${callId}`);
+    const callSnapshot = await getDocs(query(collection(db.current, `artifacts/${appId}/public/data/calls`)));
     const callDoc = callSnapshot.docs.find(doc => doc.id === callId);
-    if (!callDoc || !callDoc.data().offer) {
-        console.error("Call ID not found or no offer in document.");
-        return;
+
+    if (!callDoc || !callDoc.data()?.offer) {
+      setErrorMessage("Call ID not found or call has no offer.");
+      return;
     }
     const offer = callDoc.data().offer;
 
@@ -194,12 +215,15 @@ const App = () => {
 
     // Save the answer to Firestore
     await setDoc(callDocRef, { answer: { ...answer.toJSON() } }, { merge: true });
+    setErrorMessage("Answer sent. You should see a stream shortly.");
     console.log("Answer sent.");
 
-    // Listen for ICE candidates from the 'caller' and add them to the connection
-    onSnapshot(collection(db.current, `artifacts/${__app_id}/public/data/calls/${callId}/candidates`), (snapshot) => {
+    // Listen for ICE candidates from the caller and add them
+    // Use the new appId variable here
+    const candidatesCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls/${callId}/candidates`);
+    onSnapshot(query(candidatesCollectionRef), (snapshot) => {
       snapshot.docChanges().forEach((change) => {
-        if (change.type === 'added') {
+        if (change.type === 'added' && change.doc.data().type === 'caller') {
           const candidate = new RTCIceCandidate(change.doc.data());
           newPc.addIceCandidate(candidate);
         }
@@ -207,16 +231,26 @@ const App = () => {
     });
   };
 
+  // Function to copy the call ID to the clipboard
   const copyCallId = () => {
-    navigator.clipboard.writeText(callId);
+    if (callId) {
+      navigator.clipboard.writeText(callId);
+      setErrorMessage('Call ID copied to clipboard!');
+    }
   };
-  
+
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4 font-sans">
       <header className="text-center mb-8">
         <h1 className="text-3xl md:text-4xl font-bold mb-2">WebRTC Camera Streamer</h1>
         <p className="text-gray-400">Stream your camera to another device using WebRTC and Firestore.</p>
       </header>
+
+      {errorMessage && (
+        <div className="bg-red-500 text-white p-4 rounded-xl text-center mb-4 max-w-lg mx-auto">
+          {errorMessage}
+        </div>
+      )}
 
       <div className="flex flex-col lg:flex-row gap-8 max-w-6xl mx-auto">
         {/* Left column for local camera */}
@@ -246,7 +280,7 @@ const App = () => {
           <div className="w-full h-[300px] bg-gray-700 rounded-xl overflow-hidden mb-4">
             <video ref={remoteVideoRef} autoPlay className="w-full h-full object-cover"></video>
           </div>
-          
+
           <div className="w-full space-y-4">
             <div className="flex flex-col sm:flex-row gap-2">
               <button
