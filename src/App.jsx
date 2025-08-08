@@ -1,13 +1,30 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, setDoc, onSnapshot, collection, addDoc, getDoc } from 'firebase/firestore';
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, onSnapshot, setDoc, getDocs, collection, query, addDoc } from 'firebase/firestore';
-import { Camera, Phone, Copy } from 'lucide-react';
 
-// This app uses Tailwind CSS, which is assumed to be available
 const App = () => {
-  // 1. Paste your Firebase config here
-  // IMPORTANT: Replace the placeholder values with your actual project's configuration.
+  const [callId, setCallId] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [firebaseApp, setFirebaseApp] = useState(null);
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState('');
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const peerConnection = useRef(null);
+
+  // Firestore path constants. You'll need to update 'your-app-id'
+  // to a unique identifier for your app.
+  const appId = 'your-app-id';
+  const callsCollectionPath = `/artifacts/${appId}/public/data/calls`;
+
+  // Your Firebase project configurationa
+  // You need to replace this with the config from your Firebase project.
+  // Go to your Firebase Console -> Project Settings -> Your apps
   const firebaseConfig = {
     apiKey: import.meta.env.VITE_REACT_APP_FIREBASE_API_KEY,
     authDomain: import.meta.env.VITE_REACT_APP_FIREBASE_AUTH_DOMAIN,
@@ -16,305 +33,263 @@ const App = () => {
     messagingSenderId: import.meta.env.VITE_REACT_APP_FIREBASE_MESSAGING_SENDER_ID,
     appId: import.meta.env.VITE_REACT_APP_FIREBASE_APP_ID
   };
-  const appId = firebaseConfig.appId;
 
-  // State variables for managing the app's data
-  const [localStream, setLocalStream] = useState(null);
-  const [remoteStream, setRemoteStream] = useState(null);
-  const [callId, setCallId] = useState('');
-  const [, setUserId] = useState(null);
-  const [, setIsAuthReady] = useState(false);
-  const [errorMessage, setErrorMessage] = useState('');
-
-  // useRef to hold references to DOM elements and the RTCPeerConnection object
-  const localVideoRef = useRef();
-  const remoteVideoRef = useRef();
-  const pc = useRef(null);
-
-  // Firebase service references
-  const db = useRef(null);
-  const auth = useRef(null);
-
-  // This useEffect hook runs once to initialize Firebase and handle authentication
+  // 1. Initialize Firebase and authenticate
   useEffect(() => {
-    const setupFirebase = async () => {
-      try {
-        // CORRECTION: Removed the appId as a second argument. It's already in the config object.
-        const firebaseApp = initializeApp(firebaseConfig);
-        db.current = getFirestore(firebaseApp);
-        auth.current = getAuth(firebaseApp);
-
-        // For local development, use anonymous sign-in directly.
-        await signInAnonymously(auth.current);
-
-        // Set up an auth state change listener to get the user ID
-        const unsubscribe = onAuthStateChanged(auth.current, (user) => {
-          if (user) {
-            setUserId(user.uid);
-          } else {
-            // Fallback to a random ID if no user is authenticated
-            setUserId(crypto.randomUUID());
-          }
-          setIsAuthReady(true);
-        });
-
-        // Cleanup function for the listener
-        return () => unsubscribe();
-      } catch (error) {
-        console.error("Error setting up Firebase:", error);
-        setErrorMessage("Failed to set up Firebase. Check the console for details.");
-      }
-    };
-    setupFirebase();
-  }, [appId]);
-
-  // Sync the remote stream with the video element
-  useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
-    }
-  }, [remoteStream]);
-
-  // Sync the local stream with the video element
-  useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
-  }, [localStream]);
-
-  // Function to get camera and microphone access
-  const startCamera = async () => {
-    setErrorMessage('');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      setLocalStream(stream);
-    } catch (err) {
-      console.error("Error accessing media devices:", err);
-      setErrorMessage("Could not access camera/mic. Please check permissions.");
-    }
-  };
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const firebaseAuth = getAuth(app);
 
-  // Centralized function to create and configure the RTCPeerConnection
-  const createPeerConnection = () => {
-    const iceServers = {
+      setFirebaseApp(app);
+      setDb(firestore);
+      setAuth(firebaseAuth);
+
+      onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          setIsAuthReady(true);
+        } else {
+          // Sign in anonymously for a simple, public app
+          await signInAnonymously(firebaseAuth);
+        }
+      });
+    } catch (e) {
+      console.error("Error initializing Firebase:", e);
+      setError("Failed to initialize Firebase. Check console for details.");
+    }
+  }, []);
+
+  // 2. Set up WebRTC peer connection
+  useEffect(() => {
+    if (!isAuthReady) return;
+
+    // Use a STUN server to help peers find each other
+    const servers = {
       iceServers: [
-        {
-          urls: 'stun:stun.l.google.com:19302'
-        },
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
       ],
+      iceCandidatePoolSize: 10,
     };
+    peerConnection.current = new RTCPeerConnection(servers);
 
-    // Create the new peer connection instance
-    const newPc = new RTCPeerConnection(iceServers);
-    pc.current = newPc;
-
-    // Listen for ICE candidates and save them to Firestore
-    newPc.onicecandidate = async (event) => {
-      if (event.candidate) {
-        console.log("Found ICE candidate:", event.candidate);
-        // Use the new appId variable here
-        const candidatesCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls/${callId}/candidates`);
-        // Add the candidate to Firestore, adding a type to distinguish caller/callee candidates
-        await addDoc(candidatesCollectionRef, { ...event.candidate.toJSON(), type: localStream === newPc.getLocalStreams()[0] ? 'caller' : 'callee' });
+    // Get local media stream (camera and microphone)
+    const getLocalStream = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
+        stream.getTracks().forEach((track) => {
+          peerConnection.current.addTrack(track, stream);
+        });
+      } catch (e) {
+        console.error('Error getting user media:', e);
+        setError('Could not get access to camera and microphone. Please allow permissions.');
       }
     };
+    
+    getLocalStream();
 
-    // Listen for the remote track and add it to the remote video element
-    newPc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        console.log("Received remote stream.");
-        setRemoteStream(event.streams[0]);
-      }
+    // Event listener for when the remote peer adds a track
+    peerConnection.current.ontrack = (event) => {
+      event.streams[0].getTracks().forEach((track) => {
+        if (remoteVideoRef.current.srcObject) {
+          remoteVideoRef.current.srcObject.addTrack(track);
+        } else {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      });
     };
 
-    // Add all local tracks to the peer connection
-    localStream.getTracks().forEach((track) => {
-      newPc.addTrack(track, localStream);
-    });
+    return () => {
+      if (peerConnection.current) {
+        peerConnection.current.close();
+      }
+    };
+  }, [isAuthReady]);
 
-    return newPc;
-  };
-
-  // Function for the 'caller' to create a new call
+  // 3. Create a new call
   const createCall = async () => {
-    if (!db.current || !localStream) {
-      setErrorMessage("Please start your camera before creating a call.");
+    if (!db || !isAuthReady) {
+      setError('Firebase not ready or user not authenticated.');
       return;
     }
+    setLoading(true);
+    try {
+      const callDocRef = await addDoc(collection(db, callsCollectionPath), {});
+      const newCallId = callDocRef.id;
+      setCallId(newCallId);
 
-    // Generate a unique call ID
-    const newCallId = Math.floor(Math.random() * 1000000).toString();
-    setCallId(newCallId);
-    setErrorMessage(`Call created! Share this ID: ${newCallId}`);
+      // Create a reference to the ICE candidate collections
+      const callerCandidatesCollection = collection(callDocRef, 'callerCandidates');
+      const calleeCandidatesCollection = collection(callDocRef, 'calleeCandidates');
 
-    // Use the new appId variable here
-    const callsCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls`);
-    const newCallDocRef = doc(callsCollectionRef, newCallId);
+      // Listen for ICE candidates from the local peer and save them to Firestore
+      peerConnection.current.onicecandidate = (event) => {
+        if (event.candidate) {
+          addDoc(callerCandidatesCollection, event.candidate.toJSON());
+        }
+      };
 
-    const newPc = createPeerConnection();
+      // Create an offer and set it as the local description
+      const offerDescription = await peerConnection.current.createOffer();
+      await peerConnection.current.setLocalDescription(offerDescription);
 
-    // Create the offer and set it as the local description
-    const offer = await newPc.createOffer();
-    await newPc.setLocalDescription(offer);
+      // Save the offer to Firestore
+      const offer = {
+        sdp: offerDescription.sdp,
+        type: offerDescription.type,
+      };
+      await setDoc(callDocRef, { offer });
 
-    // Save the offer to Firestore
-    await setDoc(newCallDocRef, { offer: { ...offer.toJSON() } });
-    console.log(`Call created with ID: ${newCallId}`);
+      // Listen for the remote answer
+      onSnapshot(callDocRef, (snapshot) => {
+        const data = snapshot.data();
+        if (data?.answer && !peerConnection.current.currentRemoteDescription) {
+          const answerDescription = new RTCSessionDescription(data.answer);
+          peerConnection.current.setRemoteDescription(answerDescription);
+        }
+      });
 
-    // Listen for the answer from the callee
-    onSnapshot(newCallDocRef, async (snapshot) => {
-      const data = snapshot.data();
-      // Only set the remote description if an answer exists and it hasn't been set yet
-      if (data?.answer && newPc.localDescription && !newPc.currentRemoteDescription) {
-        console.log("Received answer:", data.answer);
-        const answerDescription = new RTCSessionDescription(data.answer);
-        await newPc.setRemoteDescription(answerDescription);
+      // Listen for ICE candidates from the remote peer and add them to the connection
+      onSnapshot(calleeCandidatesCollection, (snapshot) => {
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === 'added') {
+            const candidate = new RTCIceCandidate(change.doc.data());
+            peerConnection.current.addIceCandidate(candidate);
+          }
+        });
+      });
+
+      setLoading(false);
+    } catch (e) {
+      console.error('Error creating call:', e);
+      setError('Failed to create call. See console for details.');
+      setLoading(false);
+    }
+  };
+
+  // 4. Join an existing call
+  const joinCall = async () => {
+    if (!db || !isAuthReady || !callId) {
+      setError('Firebase not ready or call ID is missing.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const callDocRef = doc(db, callsCollectionPath, callId);
+      const callDoc = await getDoc(callDocRef);
+      if (!callDoc.exists()) {
+        setError('Call with this ID does not exist.');
+        setLoading(false);
+        return;
       }
-    });
+      
+      const offer = callDoc.data().offer;
+      await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));
 
-    // Listen for ICE candidates from the callee and add them
-    // Use the new appId variable here
-    const candidatesCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls/${newCallId}/candidates`);
-    onSnapshot(query(candidatesCollectionRef), (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === 'added' && change.doc.data().type === 'callee') {
-          const candidate = new RTCIceCandidate(change.doc.data());
-          newPc.addIceCandidate(candidate);
+      // Create a reference to the ICE candidate collections
+      const callerCandidatesCollection = collection(callDocRef, 'callerCandidates');
+      const calleeCandidatesCollection = collection(callDocRef, 'calleeCandidates');
+
+      // Listen for ICE candidates from the local peer and save them to Firestore
+      peerConnection.current.onicecandidate = (event) => {
+        if (event.candidate) {
+          addDoc(calleeCandidatesCollection, event.candidate.toJSON());
         }
+      };
+
+      // Create an answer and set it as the local description
+      const answerDescription = await peerConnection.current.createAnswer();
+      await peerConnection.current.setLocalDescription(answerDescription);
+
+      // Save the answer to Firestore
+      const answer = {
+        sdp: answerDescription.sdp,
+        type: answerDescription.type,
+      };
+      await setDoc(callDocRef, { answer }, { merge: true });
+
+      // Listen for ICE candidates from the remote peer and add them to the connection
+      onSnapshot(callerCandidatesCollection, (snapshot) => {
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === 'added') {
+            const candidate = new RTCIceCandidate(change.doc.data());
+            peerConnection.current.addIceCandidate(candidate);
+          }
+        });
       });
-    });
-  };
 
-  // Function for the 'callee' to answer a call
-  const answerCall = async () => {
-    if (!db.current || !localStream || !callId) {
-      setErrorMessage("Please start your camera and enter a Call ID to answer.");
-      return;
-    }
-
-    const newPc = createPeerConnection();
-
-    // Get the offer from Firestore for the specific call ID
-    // Use the new appId variable here
-    const callDocRef = doc(db.current, `artifacts/${appId}/public/data/calls/${callId}`);
-    const callSnapshot = await getDocs(query(collection(db.current, `artifacts/${appId}/public/data/calls`)));
-    const callDoc = callSnapshot.docs.find(doc => doc.id === callId);
-
-    if (!callDoc || !callDoc.data()?.offer) {
-      setErrorMessage("Call ID not found or call has no offer.");
-      return;
-    }
-    const offer = callDoc.data().offer;
-
-    // Set the remote description with the offer
-    await newPc.setRemoteDescription(new RTCSessionDescription(offer));
-
-    // Create and set the answer
-    const answer = await newPc.createAnswer();
-    await newPc.setLocalDescription(answer);
-
-    // Save the answer to Firestore
-    await setDoc(callDocRef, { answer: { ...answer.toJSON() } }, { merge: true });
-    setErrorMessage("Answer sent. You should see a stream shortly.");
-    console.log("Answer sent.");
-
-    // Listen for ICE candidates from the caller and add them
-    // Use the new appId variable here
-    const candidatesCollectionRef = collection(db.current, `artifacts/${appId}/public/data/calls/${callId}/candidates`);
-    onSnapshot(query(candidatesCollectionRef), (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === 'added' && change.doc.data().type === 'caller') {
-          const candidate = new RTCIceCandidate(change.doc.data());
-          newPc.addIceCandidate(candidate);
-        }
-      });
-    });
-  };
-
-  // Function to copy the call ID to the clipboard
-  const copyCallId = () => {
-    if (callId) {
-      navigator.clipboard.writeText(callId);
-      setErrorMessage('Call ID copied to clipboard!');
+      setLoading(false);
+    } catch (e) {
+      console.error('Error joining call:', e);
+      setError('Failed to join call. See console for details.');
+      setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white p-4 font-sans">
-      <header className="text-center mb-8">
-        <h1 className="text-3xl md:text-4xl font-bold mb-2">WebRTC Camera Streamer</h1>
-        <p className="text-gray-400">Stream your camera to another device using WebRTC and Firestore.</p>
-      </header>
-
-      {errorMessage && (
-        <div className="bg-red-500 text-white p-4 rounded-xl text-center mb-4 max-w-lg mx-auto">
-          {errorMessage}
-        </div>
-      )}
-
-      <div className="flex flex-col lg:flex-row gap-8 max-w-6xl mx-auto">
-        {/* Left column for local camera */}
-        <div className="flex-1 bg-gray-800 p-6 rounded-2xl shadow-lg flex flex-col items-center">
-          <h2 className="text-xl font-semibold mb-4 flex items-center">
-            <Camera size={20} className="mr-2 text-green-400" />
-            Your Camera Feed
-          </h2>
-          <div className="w-full h-[300px] bg-gray-700 rounded-xl overflow-hidden mb-4">
-            <video ref={localVideoRef} autoPlay muted className="w-full h-full object-cover"></video>
-          </div>
-          <button
-            onClick={startCamera}
-            className="w-full py-3 px-6 bg-green-600 hover:bg-green-700 transition-colors rounded-xl font-bold text-lg flex items-center justify-center shadow-md focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 focus:ring-offset-gray-800"
-          >
-            <Camera size={20} className="mr-2" />
-            Start My Camera
-          </button>
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900 text-white p-4">
+      <div className="w-full max-w-4xl bg-gray-800 rounded-xl shadow-lg p-6 flex flex-col md:flex-row gap-6">
+        {/* Video Streams */}
+        <div className="flex-1 flex flex-col items-center gap-4">
+          <h2 className="text-xl font-semibold">Local Video</h2>
+          <video
+            ref={localVideoRef}
+            autoPlay
+            muted
+            className="w-full bg-black rounded-lg shadow-inner border border-gray-700"
+            style={{ aspectRatio: '16/9' }}
+          ></video>
+          <h2 className="text-xl font-semibold mt-4">Remote Video</h2>
+          <video
+            ref={remoteVideoRef}
+            autoPlay
+            className="w-full bg-black rounded-lg shadow-inner border border-gray-700"
+            style={{ aspectRatio: '16/9' }}
+          ></video>
         </div>
 
-        {/* Right column for controls and remote stream */}
-        <div className="flex-1 bg-gray-800 p-6 rounded-2xl shadow-lg flex flex-col items-center">
-          <h2 className="text-xl font-semibold mb-4 flex items-center">
-            <Phone size={20} className="mr-2 text-blue-400" />
-            Remote Stream & Controls
-          </h2>
-          <div className="w-full h-[300px] bg-gray-700 rounded-xl overflow-hidden mb-4">
-            <video ref={remoteVideoRef} autoPlay className="w-full h-full object-cover"></video>
-          </div>
-
-          <div className="w-full space-y-4">
-            <div className="flex flex-col sm:flex-row gap-2">
-              <button
-                onClick={createCall}
-                disabled={!localStream}
-                className="flex-1 py-3 px-6 bg-blue-600 hover:bg-blue-700 transition-colors rounded-xl font-bold text-lg shadow-md disabled:bg-gray-600 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-800"
-              >
-                Create Call
-              </button>
-            </div>
-
-            <div className="flex items-center gap-2">
+        {/* Controls */}
+        <div className="w-full md:w-80 flex flex-col gap-4">
+          <h1 className="text-3xl font-bold text-center mb-4">WebRTC Video Call</h1>
+          <div className="flex flex-col gap-4 p-4 bg-gray-700 rounded-lg shadow">
+            {isAuthReady && userId && (
+              <p className="text-sm text-center text-gray-300 break-all">
+                Your User ID: <span className="font-mono text-xs">{userId}</span>
+              </p>
+            )}
+            <button
+              onClick={createCall}
+              disabled={loading}
+              className="w-full px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-full transition-colors duration-200 shadow-md disabled:bg-gray-500"
+            >
+              {loading ? 'Creating...' : 'Create Call'}
+            </button>
+            <div className="flex flex-col gap-2">
               <input
                 type="text"
                 value={callId}
                 onChange={(e) => setCallId(e.target.value)}
                 placeholder="Enter Call ID"
-                className="flex-1 bg-gray-700 text-white rounded-xl py-3 px-4 focus:outline-none focus:ring-2 focus:ring-blue-500 text-center text-lg"
+                className="w-full p-2 bg-gray-800 text-white rounded-lg border border-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
               <button
-                onClick={copyCallId}
-                title="Copy Call ID"
-                className="p-3 bg-gray-600 hover:bg-gray-500 transition-colors rounded-xl shadow-md focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 focus:ring-offset-gray-800"
+                onClick={joinCall}
+                disabled={loading || !callId}
+                className="w-full px-6 py-3 bg-green-600 hover:bg-green-700 text-white font-bold rounded-full transition-colors duration-200 shadow-md disabled:bg-gray-500"
               >
-                <Copy size={20} />
-              </button>
-              <button
-                onClick={answerCall}
-                disabled={!localStream || !callId}
-                className="py-3 px-6 bg-purple-600 hover:bg-purple-700 transition-colors rounded-xl font-bold text-lg shadow-md disabled:bg-gray-600 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 focus:ring-offset-gray-800"
-              >
-                Answer Call
+                {loading ? 'Joining...' : 'Join Call'}
               </button>
             </div>
+            {error && (
+              <div className="mt-4 p-3 text-red-300 bg-red-900 rounded-lg text-center font-medium break-words">
+                {error}
+              </div>
+            )}
           </div>
         </div>
       </div>
